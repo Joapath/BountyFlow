@@ -1,0 +1,34 @@
+# PentestFlow v3 — binarios externos (no van con pip)
+#
+# Estos son tools en Go/Rust/scripts que PentestFlow necesita en PATH.
+# No se instalan con requirements.txt porque pip no maneja binarios Go.
+# Instalación completa en el README, acá va solo el checklist de qué
+# tiene que devolver `python3 pentestflow.py --check` en verde.
+
+# ── Go (go install -v <modulo>@latest) ──────────────────────────
+github.com/projectdiscovery/subfinder/v2/cmd/subfinder
+github.com/tomnomnom/assetfinder
+github.com/projectdiscovery/httpx/cmd/httpx
+github.com/projectdiscovery/dnsx/cmd/dnsx
+github.com/projectdiscovery/katana/cmd/katana
+github.com/projectdiscovery/nuclei/v3/cmd/nuclei
+github.com/lc/gau/v2/cmd/gau
+github.com/tomnomnom/waybackurls
+github.com/s0md3v/uro
+github.com/tomnomnom/gf
+github.com/channyein1337/jsleak
+github.com/LukaSikic/subzy
+github.com/utkusen/socialhunter
+
+# ── Binario standalone ───────────────────────────────────────────
+# findomain → https://github.com/Findomain/Findomain/releases
+
+# ── Script propio (no es un paquete, hay que configurar la ruta) ─
+# crtsh.py  → ver CONFIG["recon_tools"]["crtsh"]["script_path"] en pentestflow.py
+
+# ── gf patterns (no es un binario, son JSON en ~/.gf) ────────────
+# github.com/tomnomnom/gf              (examples/*.json)
+# github.com/1ndianl33t/Gf-Patterns    (*.json)
+
+# ── nuclei templates ──────────────────────────────────────────────
+# nuclei -update-templates
