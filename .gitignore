@@ -1,0 +1,10 @@
+Backups/
+
+# Resultados de escaneos (nunca deberían subirse al repo)
+output/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/

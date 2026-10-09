@@ -1,9 +1,9 @@
-# PentestFlow v3 — binarios externos (no van con pip)
+# BountyFlow v3 — binarios externos (no van con pip)
 #
-# Estos son tools en Go/Rust/scripts que PentestFlow necesita en PATH.
-# No se instalan con requirements.txt porque pip no maneja binarios Go.
-# Instalación completa en el README, acá va solo el checklist de qué
-# tiene que devolver `python3 pentestflow.py --check` en verde.
+# Esto NO es un archivo pip-instalable (pip install -r requirements.txt
+# fallaría: son tools en Go/Rust, no paquetes Python). Es el checklist de
+# lo que python3 bountyflow.py --check tiene que ver en PATH. Detalle de
+# instalación completo en el README.
 
 # ── Go (go install -v <modulo>@latest) ──────────────────────────
 github.com/projectdiscovery/subfinder/v2/cmd/subfinder
@@ -14,17 +14,22 @@ github.com/projectdiscovery/katana/cmd/katana
 github.com/projectdiscovery/nuclei/v3/cmd/nuclei
 github.com/lc/gau/v2/cmd/gau
 github.com/tomnomnom/waybackurls
-github.com/s0md3v/uro
 github.com/tomnomnom/gf
 github.com/channyein1337/jsleak
 github.com/LukaSikic/subzy
 github.com/utkusen/socialhunter
 
+# ── Python (pip install <paquete>) ───────────────────────────────
+sublist3r
+shodanx
+uro
+
 # ── Binario standalone ───────────────────────────────────────────
 # findomain → https://github.com/Findomain/Findomain/releases
 
 # ── Script propio (no es un paquete, hay que configurar la ruta) ─
-# crtsh.py  → ver CONFIG["recon_tools"]["crtsh"]["script_path"] en pentestflow.py
+# crtsh.py  → ver CONFIG["recon_tools"]["crtsh"]["script_path"] en bountyflow.py
+# Deshabilitado por defecto (enabled: False) hasta que configures la ruta.
 
 # ── gf patterns (no es un binario, son JSON en ~/.gf) ────────────
 # github.com/tomnomnom/gf              (examples/*.json)

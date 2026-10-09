@@ -72,6 +72,12 @@ CONFIG = {
     "vpn_safe": {
         "max_parallel_tools": 2,   # tools de red corriendo en simultáneo
         "stagger_delay": 2.0,      # segundos entre el lanzamiento de cada tool
+        # Con -dL (lista de dominios): los dominios se procesan SIEMPRE de
+        # a uno (nunca en paralelo entre sí — eso es lo que evita saturar
+        # la VPN). Esta pausa es solo un respiro entre el final de un
+        # dominio y el arranque del siguiente, no afecta el paralelismo
+        # interno de cada dominio (max_parallel_tools arriba).
+        "between_domains_delay": 5.0,
     },
 
     # ── Herramientas de enumeración de subdominios ──────────────
@@ -108,7 +114,7 @@ CONFIG = {
         # después se busca el archivo más reciente que matchee
         # "output_glob" para copiarlo al pipeline.
         "crtsh": {
-            "enabled": True,  # poné False si todavía no configuraste la ruta
+            "enabled": False,  # poné True una vez que configures script_path abajo
             "script_path": "/ruta/completa/a/crtsh.py",   # <-- EDITÁ ESTO
             "cmd": ["python3", "{script_path}", "{domain}"],
             # Patrón para encontrar el archivo que el script deja en SU
@@ -125,8 +131,13 @@ CONFIG = {
     # ya que algunos subs salen de fuentes que listan hosts internos).
     "dnsx_resolve": {
         "enabled": True,
+        # -r fuerza resolvers públicos: si la VPN/red local empuja su propio
+        # DNS, dnsx podría resolver internos "desde afuera" por error. Fijando
+        # los resolvers nos asegura que la resolución es realmente externa.
+        "resolvers": "1.1.1.1,8.8.8.8,9.9.9.9",
         "cmd": ["dnsx", "-l", "{input}", "-o", "{output}",
-                "-a", "-silent", "-threads", "15", "-retry", "2"],
+                "-a", "-silent", "-threads", "15", "-retry", "2",
+                "-r", "{resolvers}"],
     },
 
     # ── httpx básico: solo detección de vivos ───────────────────
@@ -174,6 +185,7 @@ CONFIG = {
     # el registro legible como cname_hosts.txt para takeover.
     "dnsx": {
         "enabled": True,
+        "resolvers": "1.1.1.1,8.8.8.8,9.9.9.9",
         "cmd": [
             "dnsx",
             "-l", "{input}",
@@ -184,6 +196,7 @@ CONFIG = {
             "-silent",
             "-threads", "20",
             "-retry", "2",
+            "-r", "{resolvers}",
         ],
     },
 
@@ -256,9 +269,12 @@ CONFIG = {
     ],
 
     # ── jsleak ───────────────────────────────────────────────────
+    # jsleak NO acepta archivo de entrada como argumento: lee URLs por
+    # stdin. Tampoco existe el flag -v (rompía el comando con "flag
+    # provided but not defined: -v" y la fase fallaba siempre).
     "jsleak": {
         "enabled": True,
-        "cmd": ["jsleak", "-s", "-v", "-k", "-l", "{input}"],
+        "cmd": ["jsleak", "-s", "-k", "-l"],
         "stdout_mode": True,
     },
 
@@ -274,20 +290,24 @@ CONFIG = {
     },
 
     # ── nuclei: split en host templates y URL templates ──────────
+    # Rutas verificadas contra el layout actual de nuclei-templates
+    # (v9+): cves/default-logins/exposures/misconfiguration/takeovers/
+    # technologies/vulnerabilities viven bajo http/; dns/ y network/
+    # son carpetas de nivel raíz, no van bajo http/.
     "nuclei": {
         "enabled": True,
         "host_templates": [
-            "takeovers/",
-            "misconfiguration/",
-            "default-logins/",
+            "http/takeovers/",
+            "http/misconfiguration/",
+            "http/default-logins/",
             "dns/",
             "network/",
-            "technologies/",
+            "http/technologies/",
         ],
         "url_templates": [
-            "cves/",
-            "vulnerabilities/",
-            "exposures/",
+            "http/cves/",
+            "http/vulnerabilities/",
+            "http/exposures/",
         ],
         "score_threshold": 5,
         "cmd": [
@@ -295,7 +315,9 @@ CONFIG = {
             "-l", "{input}",
             "-o", "{output}",
             "-t", "{templates}",
-            "-severity", "low,medium,high,critical",
+            # "info" incluido a propósito: technologies/ es severidad info
+            # (fingerprinting) y sin esto nuclei nunca devolvía nada ahí.
+            "-severity", "info,low,medium,high,critical",
             "-c", "8",           # concurrencia baja: VPN-safe
             "-rl", "20",         # rate limit conservador
             "-etags", "dos,fuzz",
@@ -425,6 +447,37 @@ def validate_domain(domain: str) -> bool:
     return bool(re.match(pattern, domain))
 
 
+def read_domain_list(path: Path) -> List[str]:
+    """
+    Lee un archivo de dominios (uno por línea, al estilo -dL de subfinder).
+    Ignora líneas vacías y comentarios (#), valida formato, descarta
+    inválidos con aviso (sin abortar el resto de la lista) y deduplica
+    preservando el orden del archivo.
+    """
+    domains: List[str] = []
+    seen: Set[str] = set()
+    try:
+        raw_lines = path.read_text().splitlines()
+    except Exception as e:
+        print(f"{C.RED}Error:{C.RESET} no pude leer '{path}': {e}")
+        return []
+
+    for i, raw in enumerate(raw_lines, 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        line = line.lower()
+        if not validate_domain(line):
+            print(f"{C.YELLOW}Aviso:{C.RESET} línea {i} de '{path.name}' "
+                  f"no es un dominio válido, se omite: '{raw.strip()}'")
+            continue
+        if line in seen:
+            continue
+        seen.add(line)
+        domains.append(line)
+    return domains
+
+
 def normalize_url(url: str) -> str:
     """
     Normaliza una URL vaciando los valores de los query params.
@@ -504,14 +557,12 @@ class Logger:
 
 
 def banner():
+    sep = "═" * 60
     print(f"""{C.CYAN}{C.BOLD}
- ██████╗ ███████╗███╗  ██╗████████╗███████╗███████╗████████╗
- ██╔══██╗██╔════╝████╗ ██║╚══██╔══╝██╔════╝██╔════╝╚══██╔══╝
- ██████╔╝█████╗  ██╔██╗██║   ██║   █████╗  ███████╗   ██║
- ██╔═══╝ ██╔══╝  ██║╚████║   ██║   ██╔══╝  ╚════██║   ██║
- ██║     ███████╗██║ ╚███║   ██║   ███████╗███████║   ██║
- ╚═╝     ╚══════╝╚═╝  ╚══╝   ╚═╝   ╚══════╝╚══════╝   ╚═╝
-{C.RESET}{C.YELLOW}{C.BOLD}         Joapath  ─  ARG-team  ─  v3 (VPN-safe){C.RESET}
+{sep}
+   B O U N T Y F L O W   v3  —  Recon + Intelligence
+{sep}
+{C.RESET}{C.YELLOW}{C.BOLD}         Joapath  ─  ARG-team  ─  (VPN-safe){C.RESET}
 {C.DIM}         github.com/Joapath/BountyFlow{C.RESET}
 """)
 
@@ -520,7 +571,7 @@ def banner():
 #   CLASE PRINCIPAL
 # ═══════════════════════════════════════════════════════════════
 
-class PentestFlow:
+class BountyFlow:
 
     def __init__(self, domain: str, output_dir: Path,
                  skip_phases: list, only_phases: list,
@@ -614,26 +665,38 @@ class PentestFlow:
                 output_file: Optional[Path] = None,
                 stdout_mode: bool = False,
                 timeout: int = 3600,
-                cwd: Optional[Path] = None) -> bool:
+                cwd: Optional[Path] = None,
+                stdin_file: Optional[Path] = None) -> bool:
         """
         Ejecuta un comando externo.
         Retorna True solo si:
           - el proceso terminó sin excepción, Y
           - el exit code es 0 o el output_file tiene contenido (algunos
             tools retornan != 0 pero escriben resultados válidos).
+
+        stdin_file: algunas tools (ej: jsleak) no aceptan un archivo de
+        entrada como argumento, leen URLs por stdin. Si se pasa, el
+        contenido de ese archivo se conecta al stdin del proceso.
         """
         self.log.run(tool, cmd)
+        stdin_fh = None
         try:
             run_cwd = str(cwd) if cwd else None
+            if stdin_file:
+                if not stdin_file.exists() or stdin_file.stat().st_size == 0:
+                    self.log.warn(f"[{tool}] stdin_file '{stdin_file}' vacío o inexistente.")
+                    return False
+                stdin_fh = open(stdin_file)
+
             if stdout_mode and output_file:
                 with open(output_file, "w") as f:
                     result = subprocess.run(
-                        cmd, stdout=f, stderr=subprocess.PIPE,
+                        cmd, stdin=stdin_fh, stdout=f, stderr=subprocess.PIPE,
                         timeout=timeout, text=True, cwd=run_cwd,
                     )
             else:
                 result = subprocess.run(
-                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    cmd, stdin=stdin_fh, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     timeout=timeout, text=True, cwd=run_cwd,
                 )
 
@@ -660,6 +723,12 @@ class PentestFlow:
         except Exception as e:
             self.log.error(f"Error inesperado ejecutando '{tool}': {e}")
             return False
+        finally:
+            if stdin_fh:
+                try:
+                    stdin_fh.close()
+                except Exception:
+                    pass
 
     def count_lines(self, file: Path) -> int:
         if not file.exists():
@@ -880,7 +949,8 @@ class PentestFlow:
 
         cmd = self.build_cmd(CONFIG["dnsx_resolve"]["cmd"],
                              input_file=self.files["allsubs"],
-                             output_file=self.files["resolved"])
+                             output_file=self.files["resolved"],
+                             extra={"{resolvers}": CONFIG["dnsx_resolve"]["resolvers"]})
         ok = self.run_cmd("dnsx (resolve)", cmd,
                           output_file=self.files["resolved"],
                           timeout=1800)
@@ -978,19 +1048,26 @@ class PentestFlow:
         if not self.should_run("dns"):
             self.log.skip("Fase dns omitida.")
             return
-        if not self.files["live"].exists() or self.count_lines(self.files["live"]) == 0:
-            self.log.warn("live.txt vacío, omitiendo dnsx.")
+        # Usamos allsubs.txt (TODOS los subdominios enumerados) y no solo
+        # live.txt: un CNAME colgante (candidato a takeover) es justamente
+        # un subdominio que NO resuelve por A / no responde HTTP, así que
+        # si filtrábamos por live.txt nos perdíamos los candidatos más
+        # jugosos para la fase de takeover.
+        if not self.files["allsubs"].exists() or self.count_lines(self.files["allsubs"]) == 0:
+            self.log.warn("allsubs.txt vacío, omitiendo dnsx.")
             return
         if not CONFIG["dnsx"]["enabled"] or not self.check_tool("dnsx"):
             return
 
         self.log.phase("FASE 4: RESOLUCIÓN DNS",
-                       "🧭 Resolviendo A/CNAME (JSON) para detectar riesgos de takeover")
+                       "🧭 Resolviendo A/CNAME (JSON) sobre TODOS los subdominios "
+                       "para detectar riesgos de takeover")
         t0 = time.time()
 
         cmd = self.build_cmd(CONFIG["dnsx"]["cmd"],
-                             input_file=self.files["live"],
-                             output_file=self.files["dns_json"])
+                             input_file=self.files["allsubs"],
+                             output_file=self.files["dns_json"],
+                             extra={"{resolvers}": CONFIG["dnsx"]["resolvers"]})
         ok = self.run_cmd("dnsx", cmd,
                           output_file=self.files["dns_json"],
                           timeout=1800)
@@ -1269,9 +1346,17 @@ class PentestFlow:
         t0 = time.time()
         total_found = 0
 
+        # Limpia resultados de categorías de una corrida anterior (con otro
+        # --focus, por ej.) para que intelligence no mezcle anotaciones viejas
+        # que ya no corresponden a los keywords activos de esta corrida.
+        for stale in self.dirs["grep"].glob("*.txt"):
+            stale.unlink(missing_ok=True)
+
         def _grep_one(keyword: str, pattern: str) -> Tuple[str, int]:
             out_file = self.dirs["grep"] / f"{keyword}.txt"
-            cmd = ["grep", "-iEo", f"^.*{pattern}.*$", str(self.files["cleanurls"])]
+            # Sin -o ni anclas: con alternancia (a|b) el anclaje ^.*a|b.*$ se rompe
+            # y -o devolvía fragmentos de URL en vez de la URL completa.
+            cmd = ["grep", "-iE", "-e", pattern, str(self.files["cleanurls"])]
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
                 matches = sorted({line for line in result.stdout.splitlines() if line.strip()})
@@ -1333,6 +1418,10 @@ class PentestFlow:
                        f"🧠 Aplicando {len(active_patterns)} patrones GF en paralelo")
         t0 = time.time()
         total_found = 0
+
+        # Mismo motivo que en grep: no dejar gf_*.txt de un --focus anterior.
+        for stale in self.dirs["gf"].glob("gf_*.txt"):
+            stale.unlink(missing_ok=True)
 
         def _run_gf(pattern: str) -> Tuple[str, int]:
             out_file = self.dirs["gf"] / f"gf_{pattern}.txt"
@@ -1405,15 +1494,15 @@ class PentestFlow:
             self.stats["jsleak"] = {"lines": 0, "time": 0, "status": "skip"}
             return
 
-        self.log.info(f"{js_count} URLs .js → pasando a jsleak")
+        self.log.info(f"{js_count} URLs .js → pasando a jsleak (vía stdin)")
 
-        cmd = self.build_cmd(CONFIG["jsleak"]["cmd"],
-                             input_file=self.files["js_urls"])
+        cmd = list(CONFIG["jsleak"]["cmd"])  # sin placeholders: no toma {input} como arg
         ok = self.run_cmd(
             "jsleak", cmd,
             output_file=self.files["jsleak_out"],
             stdout_mode=CONFIG["jsleak"].get("stdout_mode", True),
             timeout=3600,
+            stdin_file=self.files["js_urls"],
         )
         count  = self.count_lines(self.files["jsleak_out"])
         status = "ok" if (ok and count > 0) else ("empty" if ok else "error")
@@ -1479,7 +1568,7 @@ class PentestFlow:
         def _fetch_and_match(url: str):
             try:
                 req = urllib.request.Request(
-                    url, headers={"User-Agent": "Mozilla/5.0 (PentestFlow; +recon)"}
+                    url, headers={"User-Agent": "Mozilla/5.0 (BountyFlow; +recon)"}
                 )
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
                     raw = resp.read(max_bytes)
@@ -1696,8 +1785,13 @@ class PentestFlow:
                        jsregex_secret_hosts: Optional[Set[str]] = None):
         jsregex_secret_hosts = jsregex_secret_hosts or set()
 
-        source = (self.files["urls_norm"] if self.files["urls_norm"].exists()
-                  else self.files["cleanurls"])
+        # IMPORTANTE: la fuente tiene que ser cleanurls.txt (URLs reales),
+        # NUNCA urls_normalized.txt. Ese archivo solo contiene las formas
+        # normalizadas con los valores de query vaciados (?id=&page=) y
+        # se usaba antes como fuente de url_map — resultado: final_targets
+        # y high_value_targets (lo que nuclei termina escaneando) quedaban
+        # llenos de URLs no navegables con parámetros vacíos.
+        source = self.files["cleanurls"]
         if not source.exists():
             return
 
@@ -1838,7 +1932,7 @@ class PentestFlow:
     def _write_final_targets(self, sorted_entries: list, top_n: int = 200):
         with open(self.files["final_targets"], "w") as f:
             f.write("=" * 76 + "\n")
-            f.write(f"  PENTESTFLOW v3 — FINAL TARGETS  |  {self.domain}\n")
+            f.write(f"  BOUNTYFLOW v3 — FINAL TARGETS  |  {self.domain}\n")
             f.write(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"  Top {top_n} por score\n")
             f.write("=" * 76 + "\n\n")
@@ -2103,8 +2197,9 @@ class PentestFlow:
     #   ORQUESTADOR PRINCIPAL
     # ──────────────────────────────────────────────────────────────
 
-    def run(self):
-        banner()
+    def run(self, show_banner: bool = True):
+        if show_banner:
+            banner()
         self.log.info(f"Objetivo   : {C.BOLD}{self.domain}{C.RESET}")
         self.log.info(f"Output dir : {self.base_dir}")
         self.log.info(f"Inicio     : {self.start_time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -2146,6 +2241,11 @@ ALL_TOOLS = [
     "uro", "gf", "jsleak", "subzy", "nuclei",
 ]
 
+VALID_PHASES = [
+    "recon", "resolve", "httpx", "dns", "takeover", "social", "crawl",
+    "grep", "gf", "jsleak", "jsregex", "intelligence", "nuclei",
+]
+
 
 def check_dependencies(log: Optional[Logger] = None):
     if log is None:
@@ -2159,16 +2259,20 @@ def check_dependencies(log: Optional[Logger] = None):
             log.warn(f"{tool}  ← NO ENCONTRADO")
             missing.append(tool)
 
-    # crtsh es un script python, no un binario en PATH: chequeo aparte
-    crtsh_cfg   = CONFIG["recon_tools"].get("crtsh", {})
-    script_path = crtsh_cfg.get("script_path", "")
-    if script_path:
-        if Path(script_path).expanduser().exists():
+    # crtsh es un script python, no un binario en PATH: chequeo aparte.
+    # Si está deshabilitado (default) no lo contamos como "faltante" —
+    # es opt-in a propósito hasta que configures script_path.
+    crtsh_cfg = CONFIG["recon_tools"].get("crtsh", {})
+    if crtsh_cfg.get("enabled", False):
+        script_path = crtsh_cfg.get("script_path", "")
+        if script_path and Path(script_path).expanduser().exists():
             log.ok(f"crtsh.py ({script_path})")
         else:
             log.warn(f"crtsh.py  ← NO ENCONTRADO en {script_path} "
                      f"(editá CONFIG['recon_tools']['crtsh']['script_path'])")
             missing.append("crtsh.py")
+    else:
+        log.info("crtsh.py  — deshabilitado (CONFIG['recon_tools']['crtsh']['enabled'] = False)")
 
     if missing:
         print(f"\n{C.YELLOW}  Faltantes:{C.RESET} {', '.join(missing)}")
@@ -2176,6 +2280,42 @@ def check_dependencies(log: Optional[Logger] = None):
     else:
         print(f"\n{C.GREEN}  Todas las herramientas disponibles.{C.RESET}")
     return len(missing) == 0
+
+
+# ═══════════════════════════════════════════════════════════════
+#   RESUMEN DE BATCH (-dL con más de un dominio)
+# ═══════════════════════════════════════════════════════════════
+
+def print_batch_summary(results: List[Tuple[str, str, Optional["BountyFlow"]]]):
+    """results: lista de (domain, status, flow) — status: ok/error/interrupted."""
+    print(f"\n{C.BOLD}{C.CYAN}{'═' * 78}{C.RESET}")
+    print(f"{C.BOLD}{C.CYAN}  RESUMEN DE BATCH  ─  {len(results)} dominio(s){C.RESET}")
+    print(f"{C.BOLD}{C.CYAN}{'═' * 78}{C.RESET}")
+
+    header = (f"  {'DOMINIO':<32}{'ESTADO':<13}{'SUBS':<7}{'LIVE':<7}"
+              f"{'TAKEOVER':<10}{'NUCLEI':<7}")
+    print(f"{C.BOLD}{header}{C.RESET}")
+
+    icons = {"ok": C.GREEN + "✓" + C.RESET,
+              "error": C.RED + "✗" + C.RESET,
+              "interrupted": C.YELLOW + "⚠" + C.RESET}
+
+    for domain, status, flow in results:
+        icon = icons.get(status, "?")
+        stats = flow.stats if flow else {}
+        subs    = stats.get("recon", {}).get("lines", "-")
+        live    = stats.get("httpx", {}).get("lines", "-")
+        tko     = stats.get("takeover", {}).get("lines", "-")
+        nuclei  = stats.get("nuclei", {}).get("lines", "-")
+        print(f"  {domain:<32}{icon}  {status:<10}"
+              f"{str(subs):<7}{str(live):<7}{str(tko):<10}{str(nuclei):<7}")
+
+    ok_count    = sum(1 for _, s, _ in results if s == "ok")
+    error_count = sum(1 for _, s, _ in results if s == "error")
+    print(f"{C.BOLD}{C.CYAN}{'─' * 78}{C.RESET}")
+    print(f"  {C.BOLD}Completados:{C.RESET} {ok_count}/{len(results)}"
+          f"   {C.BOLD}Con error:{C.RESET} {error_count}")
+    print(f"{C.BOLD}{C.CYAN}{'═' * 78}{C.RESET}\n")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2189,12 +2329,22 @@ def parse_args():
         epilog="""
 Ejemplos:
   python3 bountyflow.py -d example.com
+  python3 bountyflow.py -dL dominios.txt
+  python3 bountyflow.py -dL dominios.txt --domain-delay 10
   python3 bountyflow.py -d example.com --skip nuclei,jsleak
   python3 bountyflow.py -d example.com --only recon,resolve,httpx,crawl
   python3 bountyflow.py -d example.com --focus api
   python3 bountyflow.py -d example.com --focus auth,upload
   python3 bountyflow.py -d example.com --output ~/pentests
   python3 bountyflow.py --check
+
+-dL (lista de dominios):
+  Un dominio por línea, '#' para comentarios. Se procesan DE A UNO
+  (nunca en paralelo entre sí) — pensado para no saturar la VPN en
+  corridas largas contra varios programas de bug bounty. Los flags
+  --skip/--only/--focus se aplican igual a todos los dominios de la
+  lista. Si un dominio falla, se loguea el error y se sigue con el
+  próximo — no aborta el batch completo.
 
 Fases disponibles:
   recon, resolve, httpx, dns, takeover, social, crawl, grep, gf,
@@ -2204,8 +2354,12 @@ Modos de foco (--focus):
   api, auth, upload, admin, secrets, sqli, ssrf
         """,
     )
-    parser.add_argument("-d", "--domain",
+    target = parser.add_mutually_exclusive_group()
+    target.add_argument("-d", "--domain",
                         help="Dominio objetivo (ej: example.com)")
+    target.add_argument("-dL", "--domain-list",
+                        help="Archivo con una lista de dominios (uno por línea, "
+                             "al estilo subfinder -dL). Se procesan secuencialmente.")
     parser.add_argument("-o", "--output", default="./output",
                         help="Directorio de salida (default: ./output)")
     parser.add_argument("--skip", default="",
@@ -2215,6 +2369,9 @@ Modos de foco (--focus):
     parser.add_argument("--focus", default="",
                         help="Modo focus: filtra grep/gf y boostea scoring "
                              "(ej: --focus api,auth)")
+    parser.add_argument("--domain-delay", type=float, default=None,
+                        help="Segundos de pausa entre dominios con -dL "
+                             "(default: CONFIG['vpn_safe']['between_domains_delay'])")
     parser.add_argument("--check", action="store_true",
                         help="Verificar herramientas instaladas y salir")
     return parser.parse_args()
@@ -2227,19 +2384,35 @@ def main():
         check_dependencies()
         sys.exit(0)
 
-    if not args.domain:
-        print(f"{C.RED}Error:{C.RESET} Especificá un dominio con -d / --domain")
+    # ── Resolver la lista de dominios a procesar (-d o -dL) ──────────
+    domains: List[str] = []
+
+    if args.domain_list:
+        list_path = Path(args.domain_list).expanduser()
+        if not list_path.exists():
+            print(f"{C.RED}Error:{C.RESET} no existe el archivo '{list_path}'.")
+            sys.exit(1)
+        domains = read_domain_list(list_path)
+        if not domains:
+            print(f"{C.RED}Error:{C.RESET} '{list_path}' no tiene ningún dominio válido.")
+            sys.exit(1)
+        print(f"{C.CYAN}  [i]{C.RESET} {len(domains)} dominio(s) válidos cargados "
+              f"desde {list_path.name}")
+    elif args.domain:
+        if not validate_domain(args.domain):
+            print(f"{C.RED}Error:{C.RESET} '{args.domain}' no tiene un formato válido.")
+            print("       Ejemplo válido: example.com, sub.example.co.uk")
+            sys.exit(1)
+        domains = [args.domain.lower()]
+    else:
+        print(f"{C.RED}Error:{C.RESET} Especificá un dominio con -d/--domain "
+              f"o una lista con -dL/--domain-list")
         print("       Usá --help para ver todas las opciones.")
         sys.exit(1)
 
-    if not validate_domain(args.domain):
-        print(f"{C.RED}Error:{C.RESET} '{args.domain}' no tiene un formato válido.")
-        print("       Ejemplo válido: example.com, sub.example.co.uk")
-        sys.exit(1)
-
-    skip_phases = [p.strip() for p in args.skip.split(",")  if p.strip()]
-    only_phases = [p.strip() for p in args.only.split(",")  if p.strip()]
-    focus_areas = [f.strip() for f in args.focus.split(",") if f.strip()]
+    skip_phases = [p.strip().lower() for p in args.skip.split(",")  if p.strip()]
+    only_phases = [p.strip().lower() for p in args.only.split(",")  if p.strip()]
+    focus_areas = [f.strip().lower() for f in args.focus.split(",") if f.strip()]
     output_dir  = Path(args.output).expanduser().resolve()
 
     valid_focus = set(CONFIG["focus_map"].keys())
@@ -2248,14 +2421,70 @@ def main():
             print(f"{C.YELLOW}Aviso:{C.RESET} Focus '{fa}' no reconocido. "
                   f"Válidos: {', '.join(sorted(valid_focus))}")
 
-    flow = PentestFlow(
-        domain=args.domain,
-        output_dir=output_dir,
-        skip_phases=skip_phases,
-        only_phases=only_phases,
-        focus_areas=focus_areas,
-    )
-    flow.run()
+    valid_phases = set(VALID_PHASES)
+    for p in skip_phases + only_phases:
+        if p not in valid_phases:
+            print(f"{C.YELLOW}Aviso:{C.RESET} Fase '{p}' no reconocida (typo?). "
+                  f"Válidas: {', '.join(VALID_PHASES)}")
+
+    is_batch = len(domains) > 1
+    domain_delay = (args.domain_delay if args.domain_delay is not None
+                     else CONFIG["vpn_safe"].get("between_domains_delay", 5.0))
+
+    if is_batch:
+        banner()
+
+    results: List[Tuple[str, str, Optional[BountyFlow]]] = []
+
+    for idx, domain in enumerate(domains, 1):
+        if is_batch and idx > 1:
+            print(f"{C.DIM}  … pausa de {domain_delay}s antes del próximo dominio "
+                  f"(VPN-safe) …{C.RESET}")
+            time.sleep(domain_delay)
+
+        if is_batch:
+            print(f"\n{C.BOLD}{C.MAGENTA}▶▶▶ [{idx}/{len(domains)}] {domain}{C.RESET}")
+
+        flow = BountyFlow(
+            domain=domain,
+            output_dir=output_dir,
+            skip_phases=skip_phases,
+            only_phases=only_phases,
+            focus_areas=focus_areas,
+        )
+        try:
+            flow.run(show_banner=not is_batch)
+            results.append((domain, "ok", flow))
+        except KeyboardInterrupt:
+            flow.log.warn("\nInterrumpido por el usuario (Ctrl+C). Cerrando prolijamente...")
+            try:
+                flow.print_summary()
+            except Exception:
+                flow.log.close()
+            print(f"{C.YELLOW}Resultados parciales en:{C.RESET} {flow.base_dir}")
+            results.append((domain, "interrupted", flow))
+            if is_batch:
+                print(f"{C.YELLOW}Batch interrumpido — se omiten los "
+                      f"{len(domains) - idx} dominios restantes.{C.RESET}")
+            break
+        except Exception as e:
+            flow.log.error(f"Error fatal no controlado: {e}")
+            flow.log.close()
+            results.append((domain, "error", flow))
+            if not is_batch:
+                raise
+            print(f"{C.RED}  [✗]{C.RESET} '{domain}' falló, sigo con el próximo "
+                  f"dominio de la lista.")
+            continue
+
+    interrupted = any(s == "interrupted" for _, s, _ in results)
+    if is_batch:
+        print_batch_summary(results)
+
+    if interrupted:
+        sys.exit(130)
+    if any(s == "error" for _, s, _ in results):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

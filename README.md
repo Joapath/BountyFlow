@@ -90,13 +90,13 @@ go install -v github.com/projectdiscovery/katana/cmd/katana@latest
 go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
 go install -v github.com/lc/gau/v2/cmd/gau@latest
 go install -v github.com/tomnomnom/waybackurls@latest
-go install -v github.com/s0md3v/uro@latest
 go install -v github.com/tomnomnom/gf@latest
 go install -v github.com/channyein1337/jsleak@latest
 go install -v github.com/LukaSikic/subzy@latest
 
 # Python tools
 pip install sublist3r
+pip install uro
 
 # findomain
 wget https://github.com/Findomain/Findomain/releases/latest/download/findomain-linux -O /usr/local/bin/findomain
@@ -133,7 +133,7 @@ configurarlo a mano en `CONFIG["recon_tools"]["crtsh"]`:
 ```
 
 El script corre con `cwd` en su propia carpeta (porque ahí tira su output en vez de
-respetar `-o`) y PentestFlow busca el archivo más reciente que matchee `output_glob`
+respetar `-o`) y BountyFlow busca el archivo más reciente que matchee `output_glob`
 para copiarlo al pipeline. Si no está configurado, se omite solo sin romper nada más.
 
 ---
@@ -160,11 +160,45 @@ python3 bountyflow.py -d example.com --focus api,auth
 python3 bountyflow.py --check
 ```
 
+### Lista de dominios (`-dL`, al estilo subfinder)
+
+Para correr BountyFlow contra varios dominios/programas sin tener que
+lanzarlo a mano uno por uno:
+
+```bash
+# dominios.txt: uno por línea, '#' para comentarios
+python3 bountyflow.py -dL dominios.txt
+
+# con los mismos flags de siempre (se aplican a TODOS los dominios)
+python3 bountyflow.py -dL dominios.txt --focus api,auth --skip nuclei
+
+# pausa custom entre dominios (default: 5s, ver CONFIG["vpn_safe"])
+python3 bountyflow.py -dL dominios.txt --domain-delay 15
+```
+
+Los dominios se procesan **siempre de a uno, nunca en paralelo entre sí** —
+es justamente lo que evita saturar la VPN en una corrida larga contra
+varios programas. El paralelismo interno de cada dominio (`max_parallel_
+tools` de `CONFIG["vpn_safe"]`) sigue aplicando igual dentro de cada uno.
+
+Si un dominio de la lista falla (tool caída, timeout, lo que sea), se
+loguea el error y se sigue con el próximo — no aborta el batch completo.
+Al final se imprime un resumen con el estado de cada dominio. Lo único que
+se comparte entre todos es `--output`; cada dominio tiene su propia carpeta
+adentro (`output/dominio_com/`, como siempre), así que no hay pisado de
+resultados.
+
 ### Re-escaneo incremental
 
 Al final de cada corrida se guarda un snapshot y se compara contra el anterior,
-generando `new_subdomains.txt` y `new_urls.txt` en `diff/`. Para procesar solo lo
-nuevo sin repetir todo el pipeline:
+generando `new_subdomains.txt` y `new_urls.txt` en `diff/`, para que sepas qué
+cambió desde la última vez.
+
+Importante: esto es solo diagnóstico. `--only` vuelve a correr las fases
+pedidas sobre el `allsubs.txt`/`cleanurls.txt` COMPLETOS, no solo sobre lo
+nuevo — no hay (todavía) un modo que filtre el pipeline a únicamente
+`new_subdomains.txt`. Lo que sí te ahorra es la fase `recon` (la más lenta,
+por las APIs externas), reutilizando lo que ya enumeraste:
 
 ```bash
 python3 bountyflow.py -d example.com \
@@ -248,12 +282,16 @@ output/
 Toda la configuración está en el diccionario `CONFIG` al inicio del script.
 
 ### Añadir un template a nuclei
+Las rutas son relativas a `~/nuclei-templates` (layout v9+): la mayoría de
+las carpetas temáticas viven bajo `http/`, salvo `dns/` y `network/` que
+están en la raíz. Verificá con `ls ~/nuclei-templates/http` si tu versión
+cambió la estructura.
 ```python
 "nuclei": {
     "url_templates": [
-        "cves/",
-        "vulnerabilities/",
-        "mi-template-custom/",  # ← añadir aquí
+        "http/cves/",
+        "http/vulnerabilities/",
+        "http/mi-template-custom/",  # ← añadir aquí
     ],
 ```
 
